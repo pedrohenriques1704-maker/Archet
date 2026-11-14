@@ -41,11 +41,77 @@ function answerLesson(i){if(quiz.passed)return;quiz.answer=quiz.options[i];quiz.
 function checkPractice(i,v){practiceChecks[i]=v}function rate(n){let text=$('#note-journal')?.value||'';selfRating=n;render();$('#note-journal').value=text}
 function finishLesson(){if(!selfRating){toast('Selecione sua autoavaliação.');return}let first=!S.completed[current.id], note=$('#note-journal')?.value?.trim()||'', mins=Math.max(1,Math.round((Date.now()-lessonStart)/60000));record(current.skill,selfRating>=3,'Prática: '+current.title,'practice');if(selfRating>=3){S.completed[current.id]={t:Date.now(),rating:selfRating};S.xp+=first?25:4}else S.xp+=2;S.sessions.push({title:current.title,t:Date.now(),minutes:mins,completed:selfRating>=3});if(note)S.journal.push({t:Date.now(),title:current.title,note});save();go('home');toast(selfRating>=3?'Aula concluída! Plano atualizado.':'Prática registrada. Vamos revisar esta aula.')}
 // Audio: unlocked by an explicit tap; synthesized reference tone, no network calls.
-async function audio(){if(!audioCtx){let AC=window.AudioContext||window.webkitAudioContext;if(!AC)throw Error('Áudio indisponível');audioCtx=new AC()}if(audioCtx.state!=='running')await audioCtx.resume();return audioCtx}
-function sound(f,d=.65,when=null,vol=.18,type='violin'){if(!audioCtx)return;let t=when??audioCtx.currentTime, g=audioCtx.createGain();g.gain.setValueAtTime(.001,t);g.gain.exponentialRampToValueAtTime(vol,t+.035);g.gain.setValueAtTime(vol*.75,t+Math.max(.06,d-.08));g.gain.exponentialRampToValueAtTime(.001,t+d+.03);g.connect(audioCtx.destination);let harmonics=type==='click'?[1]:[1,.28,.14,.075];harmonics.forEach((a,i)=>{let o=audioCtx.createOscillator(),v=audioCtx.createGain();o.type='sine';o.frequency.value=f*(i+1);v.gain.value=a;o.connect(v);v.connect(g);audioNodes.add(o);o.onended=()=>{audioNodes.delete(o);o.disconnect();v.disconnect()};o.start(t);o.stop(t+d+.06)})}
-async function playOne(n){try{await audio();sound(hz(n),.8)}catch(e){toast('Não foi possível iniciar o áudio.')}}
-function stopSequence(){seqToken++;playing=false;for(let o of audioNodes){try{o.stop()}catch{}}audioNodes.clear()}
-async function playSequence(ns,beats=[],speed=60){stopSequence();let token=seqToken;try{await audio();if(token!==seqToken)return;playing=true;let time=audioCtx.currentTime+.05,unit=60/speed;ns.forEach((n,i)=>{let b=beats[i]||1;sound(hz(n),unit*b*.87,time,.16);time+=unit*b});setTimeout(()=>{if(token===seqToken)playing=false},Math.max(0,(time-audioCtx.currentTime)*1000))}catch{toast('Áudio indisponível. Verifique o volume e toque novamente.')}}
+// Local PCM playback: HTMLMediaElement is started directly inside the user's tap.
+// Web Audio remains available for the live metronome and microphone analysis.
+let mediaPlayer=null,mediaUrl=null;
+function audioMode(mode='playback'){try{if(navigator.audioSession)navigator.audioSession.type=mode}catch{}}
+async function audio(){
+  audioMode(mic?'play-and-record':'playback');
+  if(!audioCtx||audioCtx.state==='closed'){const AC=window.AudioContext||window.webkitAudioContext;if(!AC)throw Error('Áudio indisponível');audioCtx=new AC()}
+  if(audioCtx.state!=='running'){
+    const ctx=audioCtx;
+    const resume=ctx.resume();
+    await Promise.race([resume,new Promise((_,reject)=>setTimeout(()=>reject(Error('Áudio suspenso')),2500))]);
+    if(ctx.state!=='running')throw Error('Áudio suspenso');
+  }
+  return audioCtx;
+}
+function sound(f,d=.65,when=null,vol=.18,type='violin'){
+  if(!audioCtx||audioCtx.state!=='running'||!Number.isFinite(f)||f<=0)return;
+  let t=Math.max(audioCtx.currentTime,when??audioCtx.currentTime),g=audioCtx.createGain(),peak=Math.max(.001,vol),attack=Math.min(.025,d*.25),release=Math.min(.065,d*.35);
+  g.gain.setValueAtTime(.001,t);g.gain.exponentialRampToValueAtTime(peak,t+attack);g.gain.setValueAtTime(peak*.75,t+Math.max(attack,d-release));g.gain.exponentialRampToValueAtTime(.001,t+d);g.connect(audioCtx.destination);
+  let harmonics=type==='click'?[1]:[1,.28,.14,.075];let remaining=harmonics.length;
+  harmonics.forEach((a,i)=>{let o=audioCtx.createOscillator(),v=audioCtx.createGain();o.type='sine';o.frequency.value=f*(i+1);v.gain.value=a;o.connect(v);v.connect(g);audioNodes.add(o);o.onended=()=>{audioNodes.delete(o);o.disconnect();v.disconnect();if(--remaining===0)g.disconnect()};o.start(t);o.stop(t+d+.015)})
+}
+function makeReferenceWav(ns,beats=[],speed=60){
+  const sr=22050,unit=60/clamp(Number(speed)||60,25,240);
+  const durations=ns.map((_,i)=>unit*(Number(beats[i])>0?Number(beats[i]):1));
+  const count=Math.ceil((.055+durations.reduce((a,b)=>a+b,0)+.04)*sr);
+  if(!ns.length||!Number.isFinite(count)||count>sr*600)throw Error('Sequência inválida');
+  const buf=new ArrayBuffer(44+count*2),v=new DataView(buf);
+  const tag=(p,s)=>{for(let i=0;i<s.length;i++)v.setUint8(p+i,s.charCodeAt(i))};
+  tag(0,'RIFF');v.setUint32(4,36+count*2,true);tag(8,'WAVE');tag(12,'fmt ');v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);tag(36,'data');v.setUint32(40,count*2,true);
+  let cursor=Math.round(.055*sr);
+  ns.forEach((n,i)=>{
+    const span=Math.round(durations[i]*sr),length=Math.max(1,Math.floor(span*.88)),f=hz(Number(n));
+    if(n!==null&&Number.isFinite(f)&&f>0){
+      const k=2*Math.PI*f/sr,a=Math.max(1,Math.min(.035*sr,length*.2)),r=Math.max(1,Math.min(.065*sr,length*.3));
+      for(let j=0;j<length&&cursor+j<count;j++){
+        const env=Math.min(1,j/a,(length-1-j)/r);
+        const wave=Math.sin(k*j)+.28*Math.sin(2*k*j)+.14*Math.sin(3*k*j)+.075*Math.sin(4*k*j);
+        v.setInt16(44+2*(cursor+j),Math.round(clamp(wave*.48*env,-1,1)*32767),true);
+      }
+    }
+    cursor+=span;
+  });
+  return new Blob([buf],{type:'audio/wav'});
+}
+function releaseMedia(){if(mediaPlayer){mediaPlayer.onended=null;mediaPlayer.onerror=null;mediaPlayer.pause();mediaPlayer.removeAttribute('src');mediaPlayer.load();mediaPlayer=null}if(mediaUrl){URL.revokeObjectURL(mediaUrl);mediaUrl=null}}
+function stopSequence(){seqToken++;playing=false;releaseMedia();for(let o of audioNodes){try{o.stop()}catch{}}audioNodes.clear()}
+async function playSequence(ns,beats=[],speed=60){
+  stopSequence();const token=seqToken;
+  try{
+    audioMode(mic?'play-and-record':'playback');
+    const url=URL.createObjectURL(makeReferenceWav(ns,beats,speed));
+    mediaUrl=url;const player=new Audio();mediaPlayer=player;player.preload='auto';player.src=url;player.volume=1;
+    player.onended=()=>{if(token===seqToken){playing=false;releaseMedia()}};
+    player.onerror=()=>{if(token===seqToken){playing=false;releaseMedia();toast('Falha na reprodução. Toque em Ouvir novamente.')}};
+    // No await before play(): Safari requires the originating user gesture.
+    const promise=player.play();if(promise)await promise;
+    if(token!==seqToken||mediaPlayer!==player)return false;
+    playing=true;return true;
+  }catch(e){
+    if(token!==seqToken)return false;
+    releaseMedia();
+    try{
+      await audio();if(token!==seqToken)return false;
+      let time=audioCtx.currentTime+.05,unit=60/clamp(Number(speed)||60,25,240);
+      ns.forEach((n,i)=>{let b=Number(beats[i])>0?Number(beats[i]):1;if(n!==null)sound(hz(n),unit*b*.87,time,.22);time+=unit*b});
+      playing=true;setTimeout(()=>{if(token===seqToken)playing=false},Math.max(0,(time-audioCtx.currentTime)*1000));return true;
+    }catch{if(token===seqToken)toast('Não foi possível reproduzir. Verifique volume, saída de áudio e toque novamente.');return false}
+  }
+}
+function playOne(n){return playSequence([n],[1],70)}
 function stopMetronome(){clearInterval(metTimer);metTimer=null;metBeat=0;let p=$('#pulse');if(p){p.classList.remove('on');p.textContent='—'}let m=$('#met-mini');if(m)m.textContent=''}
 async function toggleMetronome(){if(metTimer){stopMetronome();return}try{await audio();const tick=()=>{let b=metBeat%meter+1;sound(b===1?1300:850,.07,null,.12,'click');metBeat++;let p=$('#pulse');if(p){p.textContent=b;p.classList.add('on');setTimeout(()=>p?.classList.remove('on'),110)}let m=$('#met-mini');if(m)m.textContent=`Pulso ${b}/${meter} · ${bpm} BPM`};tick();metTimer=setInterval(tick,60000/bpm)}catch{toast('Não foi possível iniciar o metrônomo.')}}
 // Microphone / autocorrelation: YIN-style difference, normalized, interpolated.
@@ -69,11 +135,11 @@ let labMode='beginner', rhythmPattern=[1,1,2,1], labAnswer=null, earHeard=false,
 function setLab(l){stopSequence();stopMic();guided=null;clearTimeout(rhythmTimer);lab=l;labQ=null;labAnswer=null;labEnabled=false;earHeard=false;rhythmHeard=false;rhythmTaps=[];rhythmRun=null;if(l==='tuning')tunerTarget='auto';render()}
 function labsPage(){let obj=LABS.find(a=>a[0]===lab),content='';if(!labEnabled&&lab!=='tuning'&&lab!=='pieces')content=`<div class="card"><div class="eyebrow">Aprenda antes de exercitar</div><h2>${obj[2]} · preparação</h2><p>${({reading:'Na clave de Sol, a segunda linha é Sol4. As linhas, de baixo para cima, são Mi, Sol, Si, Ré e Fá; os espaços são Fá, Lá, Dó e Mi. Comece pelas quatro cordas abertas.',ear:'Compare a segunda altura com a primeira: subir significa mais agudo; descer, mais grave. No modo intervalos, semitom = 1, tom = 2, terça menor = 3, terça maior = 4, quarta = 5, quinta = 7 e oitava = 12 semitons.',rhythm:'Pulso é regular. Uma semínima vale um pulso; duas colcheias ocupam um pulso; a mínima dura dois. Escute o padrão e reproduza os ataques após a contagem inicial.',finger:'Corda solta = dedo 0. Indicador = 1, médio = 2, anelar = 3, mínimo = 4. No padrão maior inicial, as distâncias da corda solta são 0, 2, 4, 5 e 7 semitons. Posições baixas alteram a distância.'})[lab]}</p>${lab==='reading'?stringsVisual():lab==='finger'?fingerboard():lab==='ear'?`<div class="actions">${btn('Ouvir sobe','playSequence([62,69],[],90)','secondary')}${btn('Ouvir desce','playSequence([69,62],[],90)','secondary')}</div>`:''}<div class="control"><label>Modo</label><select onchange="labMode=this.value"><option value="beginner" ${labMode==='beginner'?'selected':''}>Fundamentos</option><option value="advanced" ${labMode==='advanced'?'selected':''}>Desafio</option></select></div><div class="actions">${btn('Entendi · iniciar','startLab()')}</div></div>`;else if(lab==='tuning')content=`<div class="card"><h2>Prática de afinação</h2><p>Afine primeiro as cordas, depois escolha uma nota-alvo. Sustente a nota sem tentar compensar a cada oscilação. Registre a amostra para medir progresso.</p>${tunerPanel()}</div>`;else if(lab==='pieces')content=piecePanel();else if(lab==='rhythm')content=rhythmPanel();else content=questionPanel();return `<h1>Laboratórios</h1><p class="muted">Treine uma habilidade específica, com explicação antes de cada rodada. Os resultados alimentam seu plano.</p><div class="grid three section">${LABS.map(([id,i,t,d])=>`<button class="card" style="text-align:left;color:var(--ink);${id===lab?'border-color:var(--wine);background:var(--soft)':''}" onclick="setLab('${id}')"><span class="metric">${i}</span><h3>${t}</h3><span class="muted small">${d}</span></button>`).join('')}</div><div class="section">${content}</div>`}
 function startLab(){labEnabled=true;newQuestion()}
-function newQuestion(){labAnswer=null;earHeard=false;rhythmHeard=false;rhythmRun=null;rhythmTaps=[];if(lab==='rhythm'){rhythmPattern=labMode==='advanced'?pick([[.5,.5,1,2],[1.5,.5,1,1],[1,.5,.5,2]]):pick([[1,1,1,1],[2,1,1],[1,1,2],[1,2,1]]);render();return}if(lab==='reading'){let n=pick(labMode==='advanced'?[55,57,59,60,62,64,65,66,67,69,71,72,73,74,76,77,78,79,81]:OPEN);let ans=full(n);labQ={n,prompt:'Qual nota está escrita?',correct:ans,opts:shuffle([ans,...shuffle([...new Set([...OPEN,...Array.from({length:19},(_,i)=>55+i)].map(full))].filter(x=>x!==ans)).slice(0,3)]),detail:`Leitura de ${full(n)}`,explain:`A nota escrita é ${full(n)}. ${fingers(n).map(p=>name(OPEN[p.string])+' '+p.t).join(' / ')}`}}else if(lab==='finger'){let s=pick([0,1,2,3]),o=pick(labMode==='advanced'?[0,1,2,3,4,5,6,7,8]:[0,2,4,5,7]),n=OPEN[s]+o;let ans=full(n);labQ={s,o,n,prompt:`Qual nota soa na corda ${name(OPEN[s])}, ${POS[o].t.toLowerCase()}?`,correct:ans,opts:shuffle([ans,...shuffle(POS.map(p=>full(OPEN[s]+p.o)).filter(a=>a!==ans)).slice(0,3)]),detail:`${name(OPEN[s])}: ${POS[o].t}`,explain:`${POS[o].t} fica ${o} semitom(ns) acima da corda, produzindo ${ans}.`}}else if(lab==='ear'){let n=pick([62,64,65,67,69,71]),i=pick(labMode==='advanced'?[1,2,3,4,5,7,12]:[-5,-3,-2,0,2,3,5]);let intervals={1:'Segunda menor',2:'Segunda maior',3:'Terça menor',4:'Terça maior',5:'Quarta justa',7:'Quinta justa',12:'Oitava'},a=labMode==='advanced'?intervals[i]:i===0?'Mesma altura':i>0?'Mais aguda':'Mais grave';labQ={n,notes:[n,n+i],prompt:labMode==='advanced'?'Qual intervalo você ouviu?':'Como a segunda nota se compara à primeira?',correct:a,opts:labMode==='advanced'?shuffle([a,...shuffle(Object.values(intervals).filter(x=>x!==a)).slice(0,3)]):['Mais grave','Mesma altura','Mais aguda'],detail:`Ouvido: ${a}`,explain:`${full(n)} → ${full(n+i)}. ${a}.`}}render()}
+function newQuestion(){stopSequence();labAnswer=null;earHeard=false;rhythmHeard=false;rhythmRun=null;rhythmTaps=[];if(lab==='rhythm'){rhythmPattern=labMode==='advanced'?pick([[.5,.5,1,2],[1.5,.5,1,1],[1,.5,.5,2]]):pick([[1,1,1,1],[2,1,1],[1,1,2],[1,2,1]]);render();return}if(lab==='reading'){let n=pick(labMode==='advanced'?[55,57,59,60,62,64,65,66,67,69,71,72,73,74,76,77,78,79,81]:OPEN);let ans=full(n);labQ={n,prompt:'Qual nota está escrita?',correct:ans,opts:shuffle([ans,...shuffle([...new Set([...OPEN,...Array.from({length:19},(_,i)=>55+i)].map(full))].filter(x=>x!==ans)).slice(0,3)]),detail:`Leitura de ${full(n)}`,explain:`A nota escrita é ${full(n)}. ${fingers(n).map(p=>name(OPEN[p.string])+' '+p.t).join(' / ')}`}}else if(lab==='finger'){let s=pick([0,1,2,3]),o=pick(labMode==='advanced'?[0,1,2,3,4,5,6,7,8]:[0,2,4,5,7]),n=OPEN[s]+o;let ans=full(n);labQ={s,o,n,prompt:`Qual nota soa na corda ${name(OPEN[s])}, ${POS[o].t.toLowerCase()}?`,correct:ans,opts:shuffle([ans,...shuffle(POS.map(p=>full(OPEN[s]+p.o)).filter(a=>a!==ans)).slice(0,3)]),detail:`${name(OPEN[s])}: ${POS[o].t}`,explain:`${POS[o].t} fica ${o} semitom(ns) acima da corda, produzindo ${ans}.`}}else if(lab==='ear'){let n=pick([62,64,65,67,69,71]),i=pick(labMode==='advanced'?[1,2,3,4,5,7,12]:[-5,-3,-2,0,2,3,5]);let intervals={1:'Segunda menor',2:'Segunda maior',3:'Terça menor',4:'Terça maior',5:'Quarta justa',7:'Quinta justa',12:'Oitava'},a=labMode==='advanced'?intervals[i]:i===0?'Mesma altura':i>0?'Mais aguda':'Mais grave';labQ={n,notes:[n,n+i],prompt:labMode==='advanced'?'Qual intervalo você ouviu?':'Como a segunda nota se compara à primeira?',correct:a,opts:labMode==='advanced'?shuffle([a,...shuffle(Object.values(intervals).filter(x=>x!==a)).slice(0,3)]):['Mais grave','Mesma altura','Mais aguda'],detail:`Ouvido: ${a}`,explain:`${full(n)} → ${full(n+i)}. ${a}.`}}render()}
 function questionPanel(){if(!labQ)return `<div class="card">${btn('Nova questão','newQuestion()')}</div>`;let q=labQ;return `<div class="card"><div class="eyebrow">${labMode==='advanced'?'Desafio':'Fundamentos'}</div><h2>${esc(q.prompt)}</h2>${lab==='reading'?staff([q.n]):lab==='finger'?fingerboard(q.s,q.o):`<div class="actions">${btn('▶ Ouvir as duas notas','hearLab()')}</div><p class="muted small">Ouça antes de responder. No modo Fundamentos, não é necessário adivinhar o nome das notas.</p>`}<div class="choices">${q.opts.map((v,i)=>`<button class="choice ${labAnswer===v?(v===q.correct?'correct':'wrong'):''}" onclick="answerLab(${i})" ${labAnswer!==null?'disabled':''}>${esc(v)}</button>`).join('')}</div>${labAnswer!==null?`<div class="feedback ${labAnswer===q.correct?'ok':'bad'}">${labAnswer===q.correct?'Correto!':'Resposta: '+esc(q.correct)+'.'} ${esc(q.explain)}</div>${btn('Próximo exercício','newQuestion()')}`:''}<div class="actions">${btn('Rever teoria','setLab(lab)','secondary small')}</div></div>`}
-function hearLab(){earHeard=true;playSequence(labQ.notes,[],90)}function answerLab(i){if(lab==='ear'&&!earHeard){toast('Ouça as notas antes de responder.');return}if(labAnswer!==null)return;labAnswer=labQ.opts[i];record(LABS.find(x=>x[0]===lab)[4],labAnswer===labQ.correct,labQ.detail);render()}
+async function hearLab(){const q=labQ;const ok=await playSequence(q.notes,[],90);if(ok&&labQ===q)earHeard=true}function answerLab(i){if(lab==='ear'&&!earHeard){toast('Ouça as notas antes de responder.');return}if(labAnswer!==null)return;labAnswer=labQ.opts[i];record(LABS.find(x=>x[0]===lab)[4],labAnswer===labQ.correct,labQ.detail);render()}
 function rhythmPanel(){return `<div class="card"><h2>Reproduza o ritmo</h2><p>Ouça o padrão. Depois pressione Iniciar tentativa. Quatro cliques de preparação serão seguidos pelo momento de começar; toque a área uma vez para cada ataque.</p><div class="grid four">${rhythmPattern.map(b=>`<div class="card center"><div class="metric">${b===2?'𝅗𝅥':b===.5?'♪':'♩'}</div><span class="muted small">${b} tempo(s)</span></div>`).join('')}</div><div class="actions">${btn('▶ Ouvir padrão','hearRhythm()')}${btn('Iniciar tentativa','beginRhythm()','secondary')}</div><div class="pulse" id="rhythm-count">—</div><button class="rhythm-tap" onclick="tapRhythm()">TOQUE AQUI</button><div id="rhythm-info" class="feedback">Aguardando · 0/${rhythmPattern.length} ataques</div><div class="actions">${btn('Novo padrão','newQuestion()','secondary small')}${btn('Rever teoria','setLab(lab)','secondary small')}</div></div>`}
-function hearRhythm(){rhythmHeard=true;playSequence(rhythmPattern.map(()=>62),rhythmPattern,60)}
+async function hearRhythm(){const pattern=rhythmPattern;const ok=await playSequence(pattern.map(()=>62),pattern,60);if(ok&&rhythmPattern===pattern)rhythmHeard=true}
 async function beginRhythm(){if(!rhythmHeard){toast('Escute o padrão uma vez.');return}stopSequence();clearTimeout(rhythmTimer);rhythmTaps=[];rhythmRun='count';try{await audio();let ctx=audioCtx,t=ctx.currentTime+.12;for(let i=0;i<4;i++)sound(850,.08,t+i,.13,'click');sound(1300,.08,t+4,.13,'click');rhythmStart=performance.now()+(t+4-ctx.currentTime)*1000;let n=0;const show=()=>{if(rhythmRun!=='count')return;let e=$('#rhythm-count');if(!e)return;if(n<4){e.textContent=++n;rhythmTimer=setTimeout(show,1000)}else{e.textContent='JÁ';rhythmRun='tap';$('#rhythm-info').textContent='Toque no pulso e siga as durações.';rhythmTimer=setTimeout(()=>finishRhythm(),Math.max(1,rhythmPattern.reduce((a,b)=>a+b,0))*1000+2500)}};show()}catch{toast('Áudio indisponível.')}}
 function tapRhythm(){if(rhythmRun!=='tap')return;rhythmTaps.push(performance.now()-rhythmStart);$('#rhythm-info').textContent=`${rhythmTaps.length}/${rhythmPattern.length} ataques`;if(rhythmTaps.length>=rhythmPattern.length)finishRhythm()}
 function finishRhythm(){clearTimeout(rhythmTimer);if(rhythmRun!=='tap')return;rhythmRun='done';let target=[],x=0;rhythmPattern.forEach(b=>{target.push(x);x+=b*1000});let n=rhythmTaps.length,errors=target.map((v,i)=>Math.abs((rhythmTaps[i]??(v+1000))-v)),avg=Math.round(errors.reduce((a,b)=>a+b,0)/errors.length),ok=n===target.length&&avg<=220;record('ritmo',ok,`Padrão ${rhythmPattern.join('–')}: ${avg} ms de desvio médio`);$('#rhythm-info').textContent=`${ok?'Bom ritmo!':'Repita mais lentamente.'} ${n}/${target.length} ataques · desvio médio estimado ${avg} ms.`;$('#rhythm-count').textContent=ok?'✓':'↻'}
